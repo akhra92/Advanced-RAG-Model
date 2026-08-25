@@ -51,3 +51,6 @@ ipython_config.py
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VS Code
+.vscode
