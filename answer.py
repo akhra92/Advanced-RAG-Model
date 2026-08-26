@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 from chromadb import PersistentClient
+from functools import lru_cache
 from huggingface_hub import InferenceClient
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
@@ -10,12 +11,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv(override=True)
 
-HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
-
 MODEL = "openai/gpt-oss-120b"
-DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
-KNOWLEDGE_BASE_PATH = Path(__file__).parent.parent / "knowledge-base"
-SUMMARIES_PATH = Path(__file__).parent.parent / "summaries"
+DB_NAME = str(Path(__file__).parent / "preprocessed_db")
+KNOWLEDGE_BASE_PATH = Path(__file__).parent / "knowledge-base"
 
 collection_name = "docs"
 embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
@@ -26,11 +24,30 @@ stop = stop_after_attempt(3)
 
 CHAT_TIMEOUT = 1200  # seconds; reasoning models can be slow, but never wait forever
 
-hf = InferenceClient(model=MODEL, token=HF_TOKEN, timeout=CHAT_TIMEOUT)
-embedder = SentenceTransformer(embedding_model)  # local embeddings: fast, free, no outages
 
-chroma = PersistentClient(path=DB_NAME)
-collection = chroma.get_or_create_collection(collection_name)
+def default_token():
+    return os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
+
+
+@lru_cache(maxsize=8)
+def get_client(token: str | None = None):
+    """
+    One client per token, so a deployed app can serve several people who each bring
+    their own token and pay for their own calls.
+    """
+    return InferenceClient(model=MODEL, token=token or default_token(), timeout=CHAT_TIMEOUT)
+
+
+@lru_cache(maxsize=1)
+def get_embedder():
+    """Local embeddings: fast, free, no outages. Loaded on first use, not on import."""
+    return SentenceTransformer(embedding_model)
+
+
+@lru_cache(maxsize=1)
+def get_collection():
+    return PersistentClient(path=DB_NAME).get_or_create_collection(collection_name)
+
 
 RETRIEVAL_K = 10
 FINAL_K = 10
@@ -89,7 +106,7 @@ def apply_order(chunks, order):
 
 
 @retry(wait=wait, stop=stop)
-def rerank(question, chunks):
+def rerank(question, chunks, token=None):
     system_prompt = """
 You are a document re-ranker.
 You are provided with a question and a list of relevant chunks of text from a query of a knowledge base.
@@ -106,7 +123,7 @@ Reply only with the list of ranked chunk ids, nothing else. Include all the chun
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    response = hf.chat_completion(
+    response = get_client(token).chat_completion(
         messages=messages,
         max_tokens=RERANK_MAX_TOKENS,
         response_format=json_schema_for(RankOrder),
@@ -133,7 +150,7 @@ def make_rag_messages(question, history, chunks):
 
 
 @retry(wait=wait, stop=stop)
-def rewrite_query(question, history=[]):
+def rewrite_query(question, history=[], token=None):
     """Rewrite the user's question to be a more specific question that is more likely to surface relevant content in the Knowledge Base."""
     message = f"""
 You are in a conversation with a user, answering questions about the company Insurellm.
@@ -149,7 +166,7 @@ Respond only with a short, refined question that you will use to search the Know
 It should be a VERY short specific question most likely to surface content. Focus on the question details.
 Do NOT answer the question yourself; only provide the short search query.
 """
-    response = hf.chat_completion(
+    response = get_client(token).chat_completion(
         messages=[{"role": "user", "content": message}],
         max_tokens=2000,
         response_format=json_schema_for(SearchQuery),
@@ -169,37 +186,39 @@ def merge_chunks(chunks, reranked):
 
 def embed(text):
     """Embed a single piece of text locally with sentence-transformers"""
-    return embedder.encode(text).tolist()
+    return get_embedder().encode(text).tolist()
 
 
 def fetch_context_unranked(question):
     query = embed(question)
-    results = collection.query(query_embeddings=[query], n_results=RETRIEVAL_K)
+    results = get_collection().query(query_embeddings=[query], n_results=RETRIEVAL_K)
     chunks = []
     for result in zip(results["documents"][0], results["metadatas"][0]):
         chunks.append(Result(page_content=result[0], metadata=result[1]))
     return chunks
 
 
-def fetch_context(original_question):
+def fetch_context(original_question, token=None):
     chunks = fetch_context_unranked(original_question)
     try:
-        rewritten_question = rewrite_query(original_question)
+        rewritten_question = rewrite_query(original_question, token=token)
         chunks = merge_chunks(chunks, fetch_context_unranked(rewritten_question))
     except Exception as e:
         print(f"Query rewrite failed ({type(e).__name__}); using the original question only")
     try:
-        chunks = rerank(original_question, chunks)
+        chunks = rerank(original_question, chunks, token=token)
     except Exception as e:
         print(f"Rerank failed ({type(e).__name__}); using retrieval order")
     return chunks[:FINAL_K]
 
 
-def answer_question(question: str, history: list[dict] = []) -> tuple[str, list]:
+def answer_question(
+    question: str, history: list[dict] = [], token: str | None = None
+) -> tuple[str, list]:
     """
     Answer a question using RAG and return the answer and the retrieved context
     """
-    chunks = fetch_context(question)
+    chunks = fetch_context(question, token=token)
     messages = make_rag_messages(question, history, chunks)
-    response = hf.chat_completion(messages=messages, max_tokens=MAX_TOKENS)
+    response = get_client(token).chat_completion(messages=messages, max_tokens=MAX_TOKENS)
     return response.choices[0].message.content, chunks
