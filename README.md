@@ -30,9 +30,12 @@ The token needs the **Make calls to Inference Providers** permission.
 
 ## Build the knowledge base
 
-Ingestion asks the LLM to split each document into overlapping, summarised chunks, so it takes
-several minutes over the 76 documents — far too slow to run on a page load. Build it once
-locally and commit the result, so the deployed app only ever reads it:
+The app indexes `knowledge-base/` into `preprocessed_db/` on first use, so it runs from a clean
+checkout with no extra steps. Later runs reuse the store.
+
+That first build is slow: ingestion asks the LLM to split each of the 76 documents into
+overlapping, summarised chunks, which takes several minutes and spends real inference quota.
+Building it ahead of time is worthwhile — the deployed app then only ever reads it:
 
 ```bash
 python ingest.py
@@ -47,7 +50,8 @@ streamlit run app.py
 
 ## Deploy to Streamlit Community Cloud
 
-1. Push the repo — including `preprocessed_db/` — to GitHub.
+1. Push the repo to GitHub. Include `preprocessed_db/` if you prebuilt it — Streamlit Cloud's
+   disk is ephemeral, so otherwise the app re-indexes after every reboot or redeploy.
 2. On [share.streamlit.io](https://share.streamlit.io), create an app pointing at `app.py`.
 3. Optionally add a shared token under **Settings → Secrets** so visitors don't need their own:
 

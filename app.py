@@ -11,14 +11,12 @@ except ImportError:
     pass
 
 import os
-from pathlib import Path
+import threading
 
 import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-
-DB_PATH = Path(__file__).parent / "preprocessed_db"
 
 st.set_page_config(page_title="Insurellm Expert Assistant", page_icon="🏢", layout="wide")
 
@@ -42,6 +40,55 @@ def load_backend():
     answer.get_embedder()
     answer.get_collection()
     return answer
+
+
+@st.cache_resource
+def build_lock():
+    """One lock per deployment, so two arrivals can't kick off ingestion at the same time."""
+    return threading.Lock()
+
+
+def indexed_chunks(answer) -> int:
+    try:
+        return answer.get_collection().count()
+    except Exception:
+        return 0
+
+
+def build_knowledge_base(answer, token):
+    """
+    Index the knowledge base on first use, so the app runs from a clean checkout with
+    no preprocessed_db/. Ingestion is one LLM call per document, so this is slow; it
+    runs once per deployment, for whoever happens to arrive first.
+    """
+    if indexed_chunks(answer):
+        return
+
+    with build_lock():
+        if indexed_chunks(answer):  # another session may have built it while we waited
+            return
+
+        import ingest
+
+        with st.status(
+            "Building the knowledge base, this runs only once...", expanded=True
+        ) as status:
+            st.write("Loading the documents...")
+            documents = ingest.fetch_documents()
+            bar = st.progress(0.0, text=f"Chunking 0 / {len(documents)} documents")
+
+            def on_progress(done, total):
+                bar.progress(done / total, text=f"Chunking {done} / {total} documents")
+
+            chunks = ingest.create_chunks(documents, token=token, on_progress=on_progress)
+            st.write(f"Embedding {len(chunks)} chunks...")
+            ingest.create_embeddings(chunks)
+            answer.get_collection.cache_clear()  # ingestion replaced the collection
+            status.update(
+                label=f"Knowledge base ready — {indexed_chunks(answer):,} chunks indexed",
+                state="complete",
+                expanded=False,
+            )
 
 
 with st.sidebar:
@@ -88,27 +135,25 @@ if "context" not in st.session_state:
 st.title("🏢 Insurellm Expert Assistant")
 st.caption("Ask me anything about Insurellm!")
 
-if not DB_PATH.exists():
-    st.error(
-        "The knowledge base has not been built yet.\n\n"
-        "Ingestion summarises and chunks every document with an LLM, so it is far too "
-        "slow to run on first page load. Build it once on your own machine and commit "
-        "the result:\n\n"
-        "```bash\npython ingest.py\ngit add preprocessed_db && git commit -m "
-        '"Add prebuilt vector store"\n```'
-    )
-    st.stop()
-
 if not token:
     st.info("👈 Enter your Hugging Face access token in the sidebar to start chatting.")
     st.stop()
 
 answer_backend = load_backend()
 
-if answer_backend.get_collection().count() == 0:
-    st.error(
-        f"`{DB_PATH.name}/` exists but holds no vectors. Rebuild it with `python ingest.py`."
+if not indexed_chunks(answer_backend):
+    document_count = len(list(answer_backend.KNOWLEDGE_BASE_PATH.rglob("*.md")))
+    st.warning(
+        "The knowledge base has not been indexed yet. Building it summarises and chunks "
+        f"all {document_count} documents with an LLM, which takes several minutes and uses "
+        "your inference quota. To skip the wait next time, run `python ingest.py` locally "
+        "and commit `preprocessed_db/`."
     )
+
+try:
+    build_knowledge_base(answer_backend, token)
+except Exception as error:
+    st.error(f"Could not build the knowledge base — check that your token is valid.\n\n{error}")
     st.stop()
 
 chat_column, context_column = st.columns(2)

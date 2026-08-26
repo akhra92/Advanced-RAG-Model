@@ -1,34 +1,24 @@
-import os
-from pathlib import Path
+from functools import partial
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from chromadb import PersistentClient
 from tqdm import tqdm
-from huggingface_hub import InferenceClient
-from sentence_transformers import SentenceTransformer
-from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 from tenacity import retry, wait_exponential
+
+from answer import DB_NAME, KNOWLEDGE_BASE_PATH, collection_name, get_client, get_embedder
 
 
 load_dotenv(override=True)
 
-HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN") or os.getenv("HF_TOKEN")
-
-MODEL = "openai/gpt-oss-120b"
-
-DB_NAME = str(Path(__file__).parent / "preprocessed_db")
-collection_name = "docs"
-embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-KNOWLEDGE_BASE_PATH = Path(__file__).parent / "knowledge-base"
 AVERAGE_CHUNK_SIZE = 100
 MAX_TOKENS = 16000
 EMBED_BATCH_SIZE = 32
 wait = wait_exponential(multiplier=1, min=10, max=240)
 
-
+# Chunking is a wait on the inference API, so threads are enough - and unlike a
+# process pool they are safe to start from inside a Streamlit script run.
 WORKERS = 3
-
-hf = InferenceClient(model=MODEL, token=HF_TOKEN, timeout=1200)
 
 
 def json_schema_for(model_class):
@@ -118,9 +108,9 @@ def make_messages(document):
 
 
 @retry(wait=wait)
-def process_document(document):
+def process_document(document, token=None):
     messages = make_messages(document)
-    response = hf.chat_completion(
+    response = get_client(token).chat_completion(
         messages=messages, max_tokens=MAX_TOKENS, response_format=json_schema_for(Chunks)
     )
     reply = response.choices[0].message.content
@@ -128,22 +118,27 @@ def process_document(document):
     return [chunk.as_result(document) for chunk in doc_as_chunks]
 
 
-def create_chunks(documents):
+def create_chunks(documents, token=None, on_progress=None):
     """
     Create chunks using a number of workers in parallel.
     If you get a rate limit error, set the WORKERS to 1.
+    on_progress, if given, is called with (documents_done, documents_total) so a UI
+    can show how far along a long ingest is.
     """
     chunks = []
-    with Pool(processes=WORKERS) as pool:
-        for result in tqdm(pool.imap_unordered(process_document, documents), total=len(documents)):
+    worker = partial(process_document, token=token)
+    with ThreadPool(processes=WORKERS) as pool:
+        results = tqdm(pool.imap_unordered(worker, documents), total=len(documents))
+        for done, result in enumerate(results, start=1):
             chunks.extend(result)
+            if on_progress:
+                on_progress(done, len(documents))
     return chunks
 
 
 def embed(texts):
     """Embed texts locally with sentence-transformers"""
-    embedder = SentenceTransformer(embedding_model)
-    return embedder.encode(texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=True).tolist()
+    return get_embedder().encode(texts, batch_size=EMBED_BATCH_SIZE, show_progress_bar=True).tolist()
 
 
 def create_embeddings(chunks):
