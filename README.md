@@ -4,7 +4,7 @@ An advanced retrieval-augmented chat assistant that answers questions about Insu
 local markdown knowledge base. Every answer goes through query rewriting, dense retrieval and
 an LLM re-ranking pass before generation.
 
-[Live Demo](https://share.streamlit.app/) — you need to bring your own Hugging Face token.
+[Live Demo](https://advanced-rag-model.streamlit.app/) — you need to bring your own Hugging Face token.
 
 ## Stack
 
@@ -47,22 +47,6 @@ git add preprocessed_db && git commit -m "Add prebuilt vector store"
 ```bash
 streamlit run app.py
 ```
-
-## Deploy to Streamlit Community Cloud
-
-1. Push the repo to GitHub. Include `preprocessed_db/` if you prebuilt it — Streamlit Cloud's
-   disk is ephemeral, so otherwise the app re-indexes after every reboot or redeploy.
-2. On [share.streamlit.io](https://share.streamlit.io), create an app pointing at `app.py`.
-3. Optionally add a shared token under **Settings → Secrets** so visitors don't need their own:
-
-   ```toml
-   HF_TOKEN = "hf_..."
-   ```
-
-   Leave it out and each visitor supplies their own token in the sidebar.
-
-If the build fails on `sqlite3` being too old for Chroma, add `pysqlite3-binary` to
-`requirements.txt`; `app.py` already swaps it in when it is present.
 
 ## Files
 
